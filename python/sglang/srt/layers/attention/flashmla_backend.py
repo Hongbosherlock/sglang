@@ -66,6 +66,163 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        
+        self.forward_metadata = None
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_decode_or_idle():
+            bs = forward_batch.batch_size
+            max_seqlen_pad = triton.cdiv(forward_batch.seq_lens.max().item(), PAGE_SIZE)
+            flashmla_index = torch.full(
+                (bs, max_seqlen_pad), -1, dtype=torch.int32, device=forward_batch.req_pool_indices.device
+            )
+            create_flashmla_kv_indices_triton[(bs,)](
+                self.indices_updater_decode.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                None,
+                flashmla_index,
+                self.indices_updater_decode.req_to_token.size(1),
+                flashmla_index.size(1),
+                max_seqlen_pad,
+            )
+
+            mla_metadata, mla_splits = get_mla_metadata(
+                forward_batch.seq_lens.to(torch.int32),
+                1 * self.num_q_heads // self.num_kv_heads,
+                self.num_kv_heads,
+            )
+        else:
+            flashmla_index = None
+            mla_metadata = None
+            mla_splits = None
+
+        self.forward_metadata = (
+            flashmla_index,
+            mla_metadata,
+            mla_splits,
+        )
+
+
+    def init_cuda_graph_state(
+        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+    ):
+        # kv_indices equal to flashmla_index
+        if kv_indices_buf is None:
+            cuda_graph_kv_indices = torch.full(
+                (max_bs, self.max_context_len,),
+                -1,
+                dtype=torch.int32,
+                device="cuda",
+            )
+        else:
+            cuda_graph_kv_indices = kv_indices_buf
+
+        # mla_metadata, mla_splits = get_mla_metadata(
+        #     seq_lens.to(torch.int32),
+        #     1 * self.num_q_heads // self.num_kv_heads,
+        #     self.num_kv_heads,
+        # )
+        mla_splits = None
+        mla_metadata = None
+        self.cuda_graph_kv_indices = cuda_graph_kv_indices
+        self.cuda_graph_mla_metadata = mla_splits
+        self.cuda_graph_mla_splits = mla_metadata
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
+    ):
+        if forward_mode.is_decode_or_idle():
+            if spec_info is None:
+                print("capture cuda graph-------------------")
+                flashmla_index = self.cuda_graph_kv_indices
+                # max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
+                # flashmla_index = torch.full(
+                #     (bs, max_seqlen_pad), -1, dtype=torch.int32, device=req_pool_indices.device
+                # )
+                # self.cuda_graph_kv_indices = flashmla_index
+                max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
+                create_flashmla_kv_indices_triton[(bs,)](
+                    self.indices_updater_decode.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    None,
+                    flashmla_index,
+                    self.indices_updater_decode.req_to_token.size(1),
+                    flashmla_index.size(1),
+                    max_seqlen_pad,
+                )
+            else:
+                flashmla_index = spec_info.kv_indices
+
+            # mla_metadata = self.cuda_graph_mla_metadata
+            # mla_splits = self.cuda_graph_mla_splits
+            self.cuda_graph_mla_metadata, self.cuda_graph_mla_splits = get_mla_metadata(
+                seq_lens.to(torch.int32),
+                1 * self.num_q_heads // self.num_kv_heads,
+                self.num_kv_heads,
+            )
+            mla_metadata = self.cuda_graph_mla_metadata
+            mla_splits = self.cuda_graph_mla_splits
+
+        elif forward_mode.is_target_verify():
+            # TODO: Add support for nextn
+            pass
+        else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")
+
+        self.forward_metadata = (
+            flashmla_index,
+            mla_metadata,
+            mla_splits,
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        if forward_mode.is_decode_or_idle():
+            if spec_info is None:
+                print("replay cuda graph-------------------")
+                # flashmla_index = self.cuda_graph_kv_indices
+                max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
+                flashmla_index = torch.full(
+                    (bs, max_seqlen_pad), -1, dtype=torch.int32, device=req_pool_indices.device
+                )
+                create_flashmla_kv_indices_triton[(bs,)](
+                    self.indices_updater_decode.req_to_token,
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    None,
+                    flashmla_index,
+                    self.indices_updater_decode.req_to_token.size(1),
+                    flashmla_index.size(1),
+                    max_seqlen_pad,
+                )
+            else:
+                flashmla_index[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+        elif forward_mode.is_target_verify():
+            # TODO: Add support for nextn
+            pass
+        else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")       
+    
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 0
 
     def forward_decode(
         self,
@@ -89,26 +246,28 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
         bs = forward_batch.batch_size
 
-        max_seqlen_pad = triton.cdiv(forward_batch.seq_lens.max().item(), PAGE_SIZE)
-        flashmla_index = torch.full(
-            (bs, max_seqlen_pad), -1, dtype=torch.int32, device=q.device
-        )
-        create_flashmla_kv_indices_triton[(bs,)](
-            self.indices_updater_decode.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            None,
-            flashmla_index,
-            self.indices_updater_decode.req_to_token.size(1),
-            flashmla_index.size(1),
-            max_seqlen_pad,
-        )
+        # max_seqlen_pad = triton.cdiv(forward_batch.seq_lens.max().item(), PAGE_SIZE)
+        # flashmla_index = torch.full(
+        #     (bs, max_seqlen_pad), -1, dtype=torch.int32, device=q.device
+        # )
+        # create_flashmla_kv_indices_triton[(bs,)](
+        #     self.indices_updater_decode.req_to_token,
+        #     forward_batch.req_pool_indices,
+        #     forward_batch.seq_lens,
+        #     None,
+        #     flashmla_index,
+        #     self.indices_updater_decode.req_to_token.size(1),
+        #     flashmla_index.size(1),
+        #     max_seqlen_pad,
+        # )
 
-        mla_metadata, mla_splits = get_mla_metadata(
-            forward_batch.seq_lens.to(torch.int32),
-            1 * self.num_q_heads // self.num_kv_heads,
-            self.num_kv_heads,
-        )
+        # mla_metadata, mla_splits = get_mla_metadata(
+        #     forward_batch.seq_lens.to(torch.int32),
+        #     1 * self.num_q_heads // self.num_kv_heads,
+        #     self.num_kv_heads,
+        # )
+
+        flashmla_index, mla_metadata, mla_splits = self.forward_metadata
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
